@@ -1,0 +1,287 @@
+# devin-compliance-report.yml
+# ============================================================================
+# Scheduled workflow that triggers a Devin session to generate a weekly
+# compliance report on CodeQL alert status across the repository.
+#
+# The report covers:
+#   - Total open / fixed / new alerts (by severity and CWE category)
+#   - Mean time to remediation
+#   - Trend over past 4 weeks
+#   - Audit-ready summary for compliance teams
+#
+# SETUP:
+#   1. Copy to .github/workflows/devin-compliance-report.yml
+#   2. Add repository secrets:
+#      - DEVIN_API_KEY, DEVIN_ORG_ID (same as remediation workflow)
+#   3. Optionally set DEVIN_COMPLIANCE_PLAYBOOK_ID variable.
+# ============================================================================
+
+name: "Devin: Weekly Compliance Report"
+
+on:
+  schedule:
+    # Every Monday at 8 AM UTC
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      detail_level:
+        description: "Report detail level"
+        required: false
+        default: "medium"
+        type: choice
+        options:
+          - low
+          - medium
+          - high
+
+permissions:
+  security-events: read
+  issues: write
+  contents: read
+
+env:
+  DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+  DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+  DEVIN_PLAYBOOK_ID: ${{ vars.DEVIN_COMPLIANCE_PLAYBOOK_ID }}
+  REPORT_DETAIL_LEVEL: ${{ github.event.inputs.detail_level || vars.DEVIN_REPORT_DETAIL_LEVEL || 'medium' }}
+
+jobs:
+  compliance-report:
+    name: "Generate Weekly Compliance Report"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Gather alert statistics
+        id: stats
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import requests
+          from datetime import datetime, timedelta
+          from collections import defaultdict
+
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPO"]
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+          }
+
+          # ── Fetch all code scanning alerts ──────────────────────────────
+          def fetch_alerts(state):
+              alerts = []
+              page = 1
+              while True:
+                  resp = requests.get(
+                      f"https://api.github.com/repos/{repo}/code-scanning/alerts",
+                      headers=headers,
+                      params={"state": state, "per_page": 100, "page": page, "tool_name": "CodeQL"},
+                  )
+                  if resp.status_code == 404:
+                      return []  # Code scanning not enabled
+                  resp.raise_for_status()
+                  batch = resp.json()
+                  if not batch:
+                      break
+                  alerts.extend(batch)
+                  page += 1
+              return alerts
+
+          open_alerts = fetch_alerts("open")
+          fixed_alerts = fetch_alerts("fixed")
+          dismissed_alerts = fetch_alerts("dismissed")
+
+          now = datetime.utcnow()
+          week_ago = now - timedelta(days=7)
+
+          # ── Categorize ─────────────────────────────────────────────────
+          def parse_dt(s):
+              if not s:
+                  return None
+              return datetime.fromisoformat(s.replace("Z", "+00:00")).replace(tzinfo=None)
+
+          severity_counts = defaultdict(lambda: {"open": 0, "fixed_this_week": 0, "new_this_week": 0, "total_fixed": 0})
+          cwe_counts = defaultdict(lambda: {"open": 0, "fixed": 0})
+
+          for alert in open_alerts:
+              sev = alert.get("rule", {}).get("security_severity_level", "unknown")
+              severity_counts[sev]["open"] += 1
+              created = parse_dt(alert.get("created_at"))
+              if created and created > week_ago:
+                  severity_counts[sev]["new_this_week"] += 1
+              # CWEs
+              for tag in alert.get("rule", {}).get("tags", []):
+                  if tag.lower().startswith("cwe-"):
+                      cwe_counts[tag.upper()]["open"] += 1
+
+          for alert in fixed_alerts:
+              sev = alert.get("rule", {}).get("security_severity_level", "unknown")
+              severity_counts[sev]["total_fixed"] += 1
+              fixed_at = parse_dt(alert.get("fixed_at") or alert.get("dismissed_at"))
+              if fixed_at and fixed_at > week_ago:
+                  severity_counts[sev]["fixed_this_week"] += 1
+              for tag in alert.get("rule", {}).get("tags", []):
+                  if tag.lower().startswith("cwe-"):
+                      cwe_counts[tag.upper()]["fixed"] += 1
+
+          # ── Build summary ──────────────────────────────────────────────
+          total_open = len(open_alerts)
+          total_fixed = len(fixed_alerts)
+          total_dismissed = len(dismissed_alerts)
+          new_this_week = sum(v["new_this_week"] for v in severity_counts.values())
+          fixed_this_week = sum(v["fixed_this_week"] for v in severity_counts.values())
+
+          stats = {
+              "report_date": now.strftime("%Y-%m-%d"),
+              "repo": repo,
+              "total_open": total_open,
+              "total_fixed": total_fixed,
+              "total_dismissed": total_dismissed,
+              "new_this_week": new_this_week,
+              "fixed_this_week": fixed_this_week,
+              "net_change": new_this_week - fixed_this_week,
+              "by_severity": dict(severity_counts),
+              "by_cwe": dict(cwe_counts),
+          }
+
+          with open("alert_stats.json", "w") as f:
+              json.dump(stats, f, indent=2, default=str)
+
+          # Summary for the prompt
+          summary = f"""Repository: {repo}
+          Report Date: {now.strftime('%Y-%m-%d')}
+          Total Open Alerts: {total_open}
+          Total Fixed (all time): {total_fixed}
+          New This Week: {new_this_week}
+          Fixed This Week: {fixed_this_week}
+          Net Change: {'+' if new_this_week - fixed_this_week >= 0 else ''}{new_this_week - fixed_this_week}
+          """
+
+          with open("summary.txt", "w") as f:
+              f.write(summary)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write(f"total_open={total_open}\n")
+              f.write(f"total_fixed={total_fixed}\n")
+              f.write(f"new_this_week={new_this_week}\n")
+              f.write(f"fixed_this_week={fixed_this_week}\n")
+
+          print(summary)
+          PYEOF
+
+      - name: Create Devin compliance report session
+        env:
+          DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+          DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+          DEVIN_PLAYBOOK_ID: ${{ vars.DEVIN_COMPLIANCE_PLAYBOOK_ID }}
+        run: |
+          STATS=$(cat alert_stats.json | jq -c .)
+          TODAY=$(date +%Y-%m-%d)
+
+          PROMPT=$(cat <<PROMPT_EOF
+          ## Weekly Security Compliance Report — ${TODAY}
+
+          Generate a compliance-ready security report for the repository ${{ github.repository }}.
+
+          Here are the current CodeQL alert statistics:
+          $(cat summary.txt)
+
+          Full alert data (JSON): ${STATS}
+
+          ### Report Detail Level: ${REPORT_DETAIL_LEVEL}
+
+          Generate the report at **${REPORT_DETAIL_LEVEL}** detail level:
+
+          **LOW** (executive brief — 1 page):
+          - Executive summary paragraph with traffic-light status
+          - Total open/fixed/new counts by severity
+          - Top 3 risk items
+          - One-line recommendation
+
+          **MEDIUM** (standard report — 2-4 pages):
+          - Executive summary
+          - Alert status breakdown by severity (critical, high, medium, low)
+          - Top CWE categories with open counts
+          - Week-over-week trend
+          - Remediation velocity (fixed this week vs new this week)
+          - Risk assessment for outstanding high/critical alerts
+          - Recommendations for priority remediation
+
+          **HIGH** (full audit report — 5+ pages):
+          - Everything in MEDIUM, plus:
+          - Per-alert detail for all critical and high findings (alert number, CWE, file, age, recommended fix)
+          - Historical trend chart data (4-week rolling)
+          - CWE-to-regulation mapping (which HIPAA/FDA controls each finding affects)
+          - Mean time to remediation (MTTR) calculation
+          - Detailed risk matrix (likelihood x impact)
+          - Appendix with raw data tables
+
+          ### Instructions
+          1. Analyze the alert statistics provided above.
+          2. Generate the report at the specified detail level.
+          3. Post the report as a GitHub Issue with the label "compliance-report".
+          4. If a Slack webhook is available in secrets, also post a summary to Slack.
+
+          ### Healthcare Compliance Context
+          This is a healthcare organization subject to HIPAA and FDA regulations. Flag any alerts
+          that could affect Protected Health Information (PHI), medical device communication
+          protocols, or audit log integrity as HIGH PRIORITY regardless of CodeQL severity rating.
+
+          ### Upgrade to Higher Detail
+          At the bottom of the report, include a note:
+          > Want more detail? [Click here to generate a HIGH detail report](https://github.com/${{ github.repository }}/actions/workflows/devin-compliance-report.yml?detail_level=high)
+          > Or trigger manually: Actions → "Devin: Weekly Compliance Report" → Run workflow → select "high" detail level.
+
+          ### Output Format
+          \`\`\`json
+          {
+            "report_date": "${TODAY}",
+            "total_open": <int>,
+            "total_fixed_this_week": <int>,
+            "total_new_this_week": <int>,
+            "critical_open": <int>,
+            "high_open": <int>,
+            "phi_related_alerts": <int>,
+            "report_issue_url": "<string>",
+            "trend": "improving | stable | degrading"
+          }
+          \`\`\`
+          PROMPT_EOF
+          )
+
+          PROMPT_JSON=$(echo "$PROMPT" | jq -Rsa .)
+
+          BODY="{\"prompt\": ${PROMPT_JSON}"
+          if [ -n "$DEVIN_PLAYBOOK_ID" ]; then
+            BODY="${BODY}, \"playbook_id\": \"${DEVIN_PLAYBOOK_ID}\""
+          fi
+          BODY="${BODY}}"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "https://api.devin.ai/v3/organizations/${DEVIN_ORG_ID}/sessions" \
+            -H "Authorization: Bearer ${DEVIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            SESSION_URL=$(echo "$RESPONSE_BODY" | jq -r '.url // empty')
+            echo "Compliance report session created: ${SESSION_URL}"
+          else
+            echo "::error::Failed to create Devin session (HTTP ${HTTP_CODE}): ${RESPONSE_BODY}"
+            exit 1
+          fi
+
+      - name: Upload stats artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-stats
+          path: |
+            alert_stats.json
+            summary.txt
