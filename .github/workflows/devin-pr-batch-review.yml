@@ -40,6 +40,8 @@ jobs:
   batch-review:
     name: "Generate PR Review Digest"
     runs-on: ubuntu-latest
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
     steps:
       - name: Checkout repository
@@ -275,9 +277,7 @@ jobs:
 
       # ── Post to Slack (optional) ───────────────────────────────────────────
       - name: Post to Slack
-        if: steps.batch.outputs.has_prs == 'true' && (github.event_name == 'schedule' || inputs.post_to_slack) && secrets.SLACK_WEBHOOK_URL != ''
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        if: steps.batch.outputs.has_prs == 'true' && (github.event_name == 'schedule' || inputs.post_to_slack) && env.SLACK_WEBHOOK_URL != ''
         run: |
           TOTAL="${{ steps.batch.outputs.total_prs }}"
           MINS="${{ steps.batch.outputs.total_minutes }}"
