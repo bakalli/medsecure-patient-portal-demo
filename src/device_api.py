@@ -69,5 +69,5 @@ def check_firmware_update():
 def import_device_config():
     """Import device configuration from YAML."""
     yaml_data = request.get_data(as_text=True)
-    config = yaml.load(yaml_data, Loader=yaml.FullLoader)
+    config = yaml.safe_load(yaml_data)
     return jsonify({"imported": True, "devices": len(config.get("devices", []))})
