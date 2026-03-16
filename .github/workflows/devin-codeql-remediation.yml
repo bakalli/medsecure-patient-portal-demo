@@ -187,14 +187,14 @@ jobs:
       - name: Create Devin session
         if: steps.gate.outputs.skip == 'false'
         id: devin
+        env:
+          PROMPT_JSON: ${{ steps.prompt.outputs.prompt_json }}
         run: |
-          BODY="{\"prompt\": ${{ steps.prompt.outputs.prompt_json }}"
+          BODY=$(jq -n --argjson prompt "$PROMPT_JSON" '{prompt: $prompt}')
 
           if [ -n "$DEVIN_PLAYBOOK_ID" ]; then
-            BODY="${BODY}, \"playbook_id\": \"${DEVIN_PLAYBOOK_ID}\""
+            BODY=$(echo "$BODY" | jq --arg pid "$DEVIN_PLAYBOOK_ID" '. + {playbook_id: $pid}')
           fi
-
-          BODY="${BODY}}"
 
           RESPONSE=$(curl -s -w "\n%{http_code}" \
             -X POST "https://api.devin.ai/v3/organizations/${DEVIN_ORG_ID}/sessions" \
