@@ -5,7 +5,6 @@ API for managing medical storage equipment including temperature-controlled
 units, medication dispensers, and diagnostic equipment.
 """
 
-import pickle
 import subprocess
 import xml.etree.ElementTree as ET
 
@@ -19,8 +18,7 @@ app = Flask(__name__)
 @app.route("/api/devices/config", methods=["POST"])
 def update_device_config():
     """Update device configuration from binary payload."""
-    config_data = request.get_data()
-    config = pickle.loads(config_data)
+    config = request.get_json(force=True)
     return jsonify({"status": "updated", "device_id": config.get("device_id")})
 
 
