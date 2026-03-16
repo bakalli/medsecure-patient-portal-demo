@@ -1,0 +1,311 @@
+# devin-pr-batch-review.yml
+# ============================================================================
+# Runs on a schedule (and on-demand) to group open security-fix PRs into
+# reviewable batches and post summaries to GitHub Issues and/or Slack.
+#
+# Batching strategies:
+#   1. By codebase area  — PRs touching the same directory/module
+#   2. By review effort   — estimated review time (small / medium / large)
+#
+# SETUP:
+#   1. Copy to .github/workflows/devin-pr-batch-review.yml
+#   2. Add repository secrets:
+#      - SLACK_WEBHOOK_URL (optional): Incoming webhook for Slack notifications
+#   3. Customize the cron schedule below as needed.
+# ============================================================================
+
+name: "Devin: PR Batch Review Digest"
+
+on:
+  schedule:
+    # Every weekday at 9 AM UTC (adjustable)
+    - cron: "0 9 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      post_to_slack:
+        description: "Post digest to Slack?"
+        type: boolean
+        default: true
+      create_github_issue:
+        description: "Create a GitHub issue with the digest?"
+        type: boolean
+        default: true
+
+permissions:
+  pull-requests: read
+  issues: write
+  contents: read
+
+jobs:
+  batch-review:
+    name: "Generate PR Review Digest"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Fetch and batch open security PRs
+        id: batch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          import re
+          import requests
+          from collections import defaultdict
+
+          token = os.environ["GITHUB_TOKEN"]
+          repo = os.environ["REPO"]
+          headers = {
+              "Authorization": f"Bearer {token}",
+              "Accept": "application/vnd.github+json",
+          }
+
+          # ── Fetch open PRs with security-fix label ─────────────────────────
+          prs = []
+          page = 1
+          while True:
+              resp = requests.get(
+                  f"https://api.github.com/repos/{repo}/pulls",
+                  headers=headers,
+                  params={"state": "open", "per_page": 100, "page": page},
+              )
+              resp.raise_for_status()
+              batch = resp.json()
+              if not batch:
+                  break
+              prs.extend(batch)
+              page += 1
+
+          # Filter to security-fix PRs (by label or title convention)
+          security_prs = [
+              pr for pr in prs
+              if any(l["name"] in ("security-fix", "devin-auto-fix", "security") for l in pr.get("labels", []))
+              or pr["title"].startswith("[Security]")
+          ]
+
+          if not security_prs:
+              print("No open security-fix PRs found.")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write("has_prs=false\n")
+              exit(0)
+
+          # ── Fetch changed files for each PR ────────────────────────────────
+          pr_details = []
+          for pr in security_prs:
+              files_resp = requests.get(
+                  f"https://api.github.com/repos/{repo}/pulls/{pr['number']}/files",
+                  headers=headers,
+              )
+              files_resp.raise_for_status()
+              files = files_resp.json()
+
+              total_changes = sum(f.get("changes", 0) for f in files)
+              file_paths = [f["filename"] for f in files]
+
+              # Determine top-level module/directory
+              dirs = set()
+              for fp in file_paths:
+                  parts = fp.split("/")
+                  if len(parts) > 1:
+                      dirs.add(parts[0])
+                  else:
+                      dirs.add("(root)")
+
+              # Estimate review effort
+              if total_changes <= 20:
+                  effort = "small"
+                  effort_minutes = 5
+              elif total_changes <= 100:
+                  effort = "medium"
+                  effort_minutes = 15
+              else:
+                  effort = "large"
+                  effort_minutes = 30
+
+              # Extract CWE / rule from title if present
+              cwe_match = re.search(r"(CWE-\d+)", pr["title"], re.IGNORECASE)
+              rule_match = re.search(r"Fix\s+([\w/-]+):", pr["title"])
+
+              pr_details.append({
+                  "number": pr["number"],
+                  "title": pr["title"],
+                  "url": pr["html_url"],
+                  "author": pr["user"]["login"],
+                  "created_at": pr["created_at"],
+                  "files": file_paths,
+                  "directories": sorted(dirs),
+                  "total_changes": total_changes,
+                  "effort": effort,
+                  "effort_minutes": effort_minutes,
+                  "cwe": cwe_match.group(1) if cwe_match else None,
+                  "rule_id": rule_match.group(1) if rule_match else None,
+                  "labels": [l["name"] for l in pr.get("labels", [])],
+              })
+
+          # ── Batch by codebase area ─────────────────────────────────────────
+          area_batches = defaultdict(list)
+          for pr in pr_details:
+              for d in pr["directories"]:
+                  area_batches[d].append(pr)
+
+          # Deduplicate: assign each PR to its primary directory only
+          assigned = set()
+          clean_area_batches = defaultdict(list)
+          # Sort directories by number of PRs (descending) to assign to largest group first
+          for d in sorted(area_batches.keys(), key=lambda k: len(area_batches[k]), reverse=True):
+              for pr in area_batches[d]:
+                  if pr["number"] not in assigned:
+                      clean_area_batches[d].append(pr)
+                      assigned.add(pr["number"])
+
+          # ── Batch by review effort ─────────────────────────────────────────
+          effort_batches = defaultdict(list)
+          for pr in pr_details:
+              effort_batches[pr["effort"]].append(pr)
+
+          # ── Build the digest ───────────────────────────────────────────────
+          total_prs = len(pr_details)
+          total_minutes = sum(p["effort_minutes"] for p in pr_details)
+
+          lines = []
+          lines.append(f"# Security PR Review Digest")
+          lines.append(f"")
+          lines.append(f"**{total_prs} security-fix PRs** awaiting review (~{total_minutes} min total estimated review time)")
+          lines.append(f"")
+
+          # Quick wins section
+          quick = effort_batches.get("small", [])
+          if quick:
+              lines.append(f"## Only have 5 minutes? Here are some PRs you can review quickly")
+              lines.append(f"")
+              for pr in quick:
+                  cwe_tag = f" `{pr['cwe']}`" if pr["cwe"] else ""
+                  lines.append(f"- [#{pr['number']}]({pr['url']}) — {pr['title']}{cwe_tag} (~{pr['total_changes']} lines changed)")
+              lines.append(f"")
+
+          # By area section
+          lines.append(f"## Batch by codebase area (minimize context switching)")
+          lines.append(f"")
+          for area, area_prs in sorted(clean_area_batches.items(), key=lambda x: len(x[1]), reverse=True):
+              if len(area_prs) == 0:
+                  continue
+              area_minutes = sum(p["effort_minutes"] for p in area_prs)
+              lines.append(f"### `{area}/` — {len(area_prs)} PR(s), ~{area_minutes} min")
+              lines.append(f"*These PRs all live in the `{area}/` part of the codebase. Tackling them together may minimize context switching.*")
+              lines.append(f"")
+              for pr in area_prs:
+                  cwe_tag = f" `{pr['cwe']}`" if pr["cwe"] else ""
+                  lines.append(f"- [#{pr['number']}]({pr['url']}) — {pr['title']}{cwe_tag} ({pr['effort']}, ~{pr['total_changes']} lines)")
+              lines.append(f"")
+
+          # By effort section
+          lines.append(f"## Batch by review effort")
+          lines.append(f"")
+          for effort_level in ["small", "medium", "large"]:
+              eff_prs = effort_batches.get(effort_level, [])
+              if not eff_prs:
+                  continue
+              emoji = {"small": "5 min", "medium": "~15 min", "large": "~30 min"}[effort_level]
+              lines.append(f"### {effort_level.capitalize()} ({emoji} each) — {len(eff_prs)} PR(s)")
+              for pr in eff_prs:
+                  cwe_tag = f" `{pr['cwe']}`" if pr["cwe"] else ""
+                  lines.append(f"- [#{pr['number']}]({pr['url']}) — {pr['title']}{cwe_tag}")
+              lines.append(f"")
+
+          # Summary stats
+          lines.append(f"---")
+          lines.append(f"*Generated automatically by the MedSecure Security Automation pipeline.*")
+
+          digest = "\n".join(lines)
+
+          # Write outputs
+          with open("digest.md", "w") as f:
+              f.write(digest)
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              f.write("has_prs=true\n")
+              f.write(f"total_prs={total_prs}\n")
+              f.write(f"total_minutes={total_minutes}\n")
+              f.write(f"quick_wins={len(quick)}\n")
+
+          # Also write JSON for downstream consumption
+          with open("pr_batches.json", "w") as f:
+              json.dump({
+                  "total_prs": total_prs,
+                  "total_estimated_minutes": total_minutes,
+                  "by_area": {k: [p["number"] for p in v] for k, v in clean_area_batches.items()},
+                  "by_effort": {k: [p["number"] for p in v] for k, v in effort_batches.items()},
+                  "pr_details": pr_details,
+              }, f, indent=2, default=str)
+
+          print(digest)
+          PYEOF
+
+      # ── Post to GitHub Issue ───────────────────────────────────────────────
+      - name: Create GitHub issue with digest
+        if: steps.batch.outputs.has_prs == 'true' && (github.event_name == 'schedule' || inputs.create_github_issue)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const digest = fs.readFileSync('digest.md', 'utf8');
+            const totalPrs = ${{ steps.batch.outputs.total_prs }};
+            const today = new Date().toISOString().split('T')[0];
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `[Security Review Digest] ${today} — ${totalPrs} PRs awaiting review`,
+              body: digest,
+              labels: ['security-review-digest']
+            });
+
+      # ── Post to Slack (optional) ───────────────────────────────────────────
+      - name: Post to Slack
+        if: steps.batch.outputs.has_prs == 'true' && (github.event_name == 'schedule' || inputs.post_to_slack) && secrets.SLACK_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          TOTAL="${{ steps.batch.outputs.total_prs }}"
+          MINS="${{ steps.batch.outputs.total_minutes }}"
+          QUICK="${{ steps.batch.outputs.quick_wins }}"
+          REPO="${{ github.repository }}"
+          TODAY=$(date +%Y-%m-%d)
+
+          SLACK_TEXT=$(cat <<EOF
+          :shield: *Security PR Review Digest — ${TODAY}*
+
+          *${TOTAL} security-fix PRs* awaiting review (~${MINS} min total)
+          ${QUICK} quick wins (5 min or less each)
+
+          View the full digest: https://github.com/${REPO}/issues?q=is%3Aissue+label%3Asecurity-review-digest+is%3Aopen
+
+          _Tip: Start with the quick wins to build momentum!_
+          EOF
+          )
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{\"text\": $(echo "$SLACK_TEXT" | jq -Rsa .)}"
+
+      - name: Upload batch data artifact
+        if: steps.batch.outputs.has_prs == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-batch-data
+          path: |
+            digest.md
+            pr_batches.json

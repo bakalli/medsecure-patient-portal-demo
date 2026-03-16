@@ -1,0 +1,242 @@
+# devin-codeql-remediation.yml
+# ============================================================================
+# Trigger: Fires when a new CodeQL (code-scanning) alert is created or reopened.
+# Action:  Spins up a Devin session to triage and remediate the finding.
+#
+# SETUP (drop this file into any repo):
+#   1. Copy this file to .github/workflows/devin-codeql-remediation.yml
+#   2. Add these GitHub repository secrets:
+#      - DEVIN_API_KEY   : Your Devin org API key (starts with cog_)
+#      - DEVIN_ORG_ID    : Your Devin organization ID
+#   3. (Optional) Set the DEVIN_PLAYBOOK_ID variable below to attach a playbook.
+#   4. Ensure CodeQL is already running on this repo (GitHub Advanced Security).
+#
+# This workflow is language-agnostic and multi-repo safe. It reads the alert
+# payload dynamically — no hardcoded paths, languages, or repo names.
+# ============================================================================
+
+name: "Devin: CodeQL Auto-Remediation"
+
+on:
+  code_scanning_alert:
+    types: [created, reopened]
+
+# Only one remediation session per alert at a time
+concurrency:
+  group: devin-codeql-${{ github.event.alert.number }}
+  cancel-in-progress: false
+
+permissions:
+  issues: write          # to comment on related issues
+  security-events: read  # to read code-scanning alert details
+  contents: read         # to reference repo context in the prompt
+
+env:
+  # ── Configurable ──────────────────────────────────────────────────────────
+  # Set these as GitHub repo/org secrets:
+  DEVIN_API_KEY: ${{ secrets.DEVIN_API_KEY }}
+  DEVIN_ORG_ID: ${{ secrets.DEVIN_ORG_ID }}
+  # Optional: attach a Devin playbook to every remediation session.
+  # Leave empty to use the default prompt only.
+  DEVIN_PLAYBOOK_ID: ${{ vars.DEVIN_SECURITY_FIX_PLAYBOOK_ID }}
+  # Optional: minimum severity to trigger (error, warning, note).
+  # Alerts below this level are skipped. Default: process all.
+  MIN_SEVERITY: ${{ vars.DEVIN_MIN_SEVERITY }}
+  # Optional: enable batch-PR mode for the backlog burndown script.
+  # When true, multiple alerts can be grouped into a single Devin session/PR.
+  # This does NOT affect the per-alert workflow trigger above (which always
+  # creates one session per alert). It is used by the backlog_burndown.py script.
+  BATCH_PR_MODE: ${{ vars.DEVIN_BATCH_PR_MODE }}           # "true" to enable
+  BATCH_STRATEGY: ${{ vars.DEVIN_BATCH_STRATEGY }}          # file | directory | cwe (default: file)
+  MAX_ALERTS_PER_BATCH: ${{ vars.DEVIN_MAX_ALERTS_PER_BATCH }}  # integer (default: 5)
+
+jobs:
+  remediate:
+    name: "Remediate CodeQL Alert #${{ github.event.alert.number }}"
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Extract alert metadata ────────────────────────────────────────
+      - name: Extract alert details
+        id: alert
+        run: |
+          ALERT_NUMBER="${{ github.event.alert.number }}"
+          ALERT_STATE="${{ github.event.alert.state }}"
+          RULE_ID="${{ github.event.alert.rule.id }}"
+          RULE_DESC="${{ github.event.alert.rule.description }}"
+          SEVERITY="${{ github.event.alert.rule.security_severity_level || github.event.alert.rule.severity }}"
+          TOOL_NAME="${{ github.event.alert.tool.name }}"
+          FILE_PATH="${{ github.event.alert.most_recent_instance.location.path }}"
+          START_LINE="${{ github.event.alert.most_recent_instance.location.start_line }}"
+          END_LINE="${{ github.event.alert.most_recent_instance.location.end_line }}"
+          HTML_URL="${{ github.event.alert.html_url }}"
+          REPO_FULL="${{ github.repository }}"
+
+          # Build CWE list from alert tags (CodeQL tags follow "cwe-NNN" pattern)
+          CWES=$(echo '${{ toJSON(github.event.alert.rule.tags) }}' \
+            | jq -r '.[]? // empty' \
+            | grep -i '^cwe-' \
+            | tr '\n' ', ' \
+            | sed 's/,$//')
+
+          echo "alert_number=${ALERT_NUMBER}" >> "$GITHUB_OUTPUT"
+          echo "rule_id=${RULE_ID}" >> "$GITHUB_OUTPUT"
+          echo "rule_desc=${RULE_DESC}" >> "$GITHUB_OUTPUT"
+          echo "severity=${SEVERITY}" >> "$GITHUB_OUTPUT"
+          echo "tool=${TOOL_NAME}" >> "$GITHUB_OUTPUT"
+          echo "file_path=${FILE_PATH}" >> "$GITHUB_OUTPUT"
+          echo "start_line=${START_LINE}" >> "$GITHUB_OUTPUT"
+          echo "end_line=${END_LINE}" >> "$GITHUB_OUTPUT"
+          echo "html_url=${HTML_URL}" >> "$GITHUB_OUTPUT"
+          echo "repo=${REPO_FULL}" >> "$GITHUB_OUTPUT"
+          echo "cwes=${CWES}" >> "$GITHUB_OUTPUT"
+
+      # ── 2. Severity gate (optional) ──────────────────────────────────────
+      - name: Check severity threshold
+        id: gate
+        run: |
+          MIN="${MIN_SEVERITY:-}"
+          SEVERITY="${{ steps.alert.outputs.severity }}"
+
+          if [ -z "$MIN" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          severity_rank() {
+            case "$1" in
+              critical) echo 4 ;;
+              high|error) echo 3 ;;
+              medium|warning) echo 2 ;;
+              low|note) echo 1 ;;
+              *) echo 0 ;;
+            esac
+          }
+
+          ALERT_RANK=$(severity_rank "$SEVERITY")
+          MIN_RANK=$(severity_rank "$MIN")
+
+          if [ "$ALERT_RANK" -lt "$MIN_RANK" ]; then
+            echo "Skipping: alert severity '$SEVERITY' is below threshold '$MIN'"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 3. Build the Devin prompt ────────────────────────────────────────
+      - name: Build prompt
+        if: steps.gate.outputs.skip == 'false'
+        id: prompt
+        run: |
+          PROMPT=$(cat <<'PROMPT_EOF'
+          ## Security Vulnerability Remediation
+
+          **Repository:** ${{ steps.alert.outputs.repo }}
+          **Scanner:** ${{ steps.alert.outputs.tool }}
+          **Alert #:** ${{ steps.alert.outputs.alert_number }}
+          **Rule:** ${{ steps.alert.outputs.rule_id }} — ${{ steps.alert.outputs.rule_desc }}
+          **Severity:** ${{ steps.alert.outputs.severity }}
+          **CWE(s):** ${{ steps.alert.outputs.cwes }}
+          **Location:** `${{ steps.alert.outputs.file_path }}` (lines ${{ steps.alert.outputs.start_line }}–${{ steps.alert.outputs.end_line }})
+          **Alert URL:** ${{ steps.alert.outputs.html_url }}
+
+          ### Instructions
+
+          1. Read and understand the CodeQL alert above.
+          2. Investigate the affected file and surrounding code to understand the vulnerability context.
+          3. Implement the minimal, correct fix for this vulnerability. Prefer using existing sanitization/validation libraries already in the codebase.
+          4. Ensure your fix does not break existing functionality — run the test suite and linter.
+          5. Create a PR with:
+             - Title: `[Security] Fix ${{ steps.alert.outputs.rule_id }}: ${{ steps.alert.outputs.rule_desc }}`
+             - Description that references the CodeQL alert, explains the vulnerability, and describes the fix.
+             - Label: `security-fix`
+          6. Comment on the CodeQL alert (if possible) with a link to the PR.
+
+          ### Output Format
+          ```json
+          {
+            "alert_number": <int>,
+            "rule_id": "<string>",
+            "severity": "<string>",
+            "fix_applied": <bool>,
+            "pr_url": "<string or null>",
+            "fix_description": "<string>",
+            "files_changed": ["<string>"],
+            "tests_passed": <bool>,
+            "confidence": <float 0-1>,
+            "needs_human_review": <bool>,
+            "review_notes": "<string or null>"
+          }
+          ```
+          PROMPT_EOF
+          )
+
+          # Escape for JSON
+          PROMPT_JSON=$(echo "$PROMPT" | jq -Rsa .)
+          echo "prompt_json=${PROMPT_JSON}" >> "$GITHUB_OUTPUT"
+
+      # ── 4. Create the Devin session ──────────────────────────────────────
+      - name: Create Devin session
+        if: steps.gate.outputs.skip == 'false'
+        id: devin
+        run: |
+          # Build request body
+          BODY="{\"prompt\": ${{ steps.prompt.outputs.prompt_json }}"
+
+          if [ -n "$DEVIN_PLAYBOOK_ID" ]; then
+            BODY="${BODY}, \"playbook_id\": \"${DEVIN_PLAYBOOK_ID}\""
+          fi
+
+          BODY="${BODY}}"
+
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -X POST "https://api.devin.ai/v3/organizations/${DEVIN_ORG_ID}/sessions" \
+            -H "Authorization: Bearer ${DEVIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$BODY")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          RESPONSE_BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            SESSION_URL=$(echo "$RESPONSE_BODY" | jq -r '.url // empty')
+            DEVIN_ID=$(echo "$RESPONSE_BODY" | jq -r '.devin_id // .session_id // empty')
+            echo "session_url=${SESSION_URL}" >> "$GITHUB_OUTPUT"
+            echo "devin_id=${DEVIN_ID}" >> "$GITHUB_OUTPUT"
+            echo "Devin session created: ${SESSION_URL}"
+          else
+            echo "::error::Failed to create Devin session (HTTP ${HTTP_CODE}): ${RESPONSE_BODY}"
+            exit 1
+          fi
+
+      # ── 5. Post tracking comment on the alert ───────────────────────────
+      - name: Comment on alert issue (if exists)
+        if: steps.gate.outputs.skip == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const alertNumber = ${{ steps.alert.outputs.alert_number }};
+            const sessionUrl = '${{ steps.devin.outputs.session_url }}';
+            const ruleId = '${{ steps.alert.outputs.rule_id }}';
+            const severity = '${{ steps.alert.outputs.severity }}';
+
+            // Post a repository dispatch event or log for tracking
+            console.log(`Devin session started for CodeQL alert #${alertNumber}`);
+            console.log(`Rule: ${ruleId} | Severity: ${severity}`);
+            console.log(`Session: ${sessionUrl}`);
+
+            // Create a check run to track the remediation
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: `Devin Security Fix: Alert #${alertNumber}`,
+              head_sha: context.sha,
+              status: 'in_progress',
+              output: {
+                title: `Remediating ${ruleId} (${severity})`,
+                summary: `Devin is working on fixing CodeQL alert #${alertNumber}.\n\n` +
+                         `**Rule:** ${ruleId}\n` +
+                         `**Severity:** ${severity}\n` +
+                         `**Session:** ${sessionUrl}`
+              }
+            });
