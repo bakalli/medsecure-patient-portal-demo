@@ -28,8 +28,10 @@ def search_patients():
     """Search patients by name."""
     name = request.args.get("name", "")
     db = get_db()
-    query = f"SELECT id, name, date_of_birth, medical_record_number FROM patients WHERE name LIKE '%{name}%'"
-    cursor = db.execute(query)
+    cursor = db.execute(
+        "SELECT id, name, date_of_birth, medical_record_number FROM patients WHERE name LIKE ?",
+        ("%" + name + "%",),
+    )
     results = [dict(row) for row in cursor.fetchall()]
     return jsonify(results)
 
