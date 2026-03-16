@@ -1,7 +1,7 @@
 # devin-codeql-remediation.yml
 # ============================================================================
-# Trigger: Fires when a new CodeQL (code-scanning) alert is created or reopened,
-#          OR can be triggered manually via workflow_dispatch with an alert number.
+# Trigger: Fires when a code_scanning_alert repository_dispatch event is received
+#          (e.g. from a webhook), OR manually via workflow_dispatch with an alert number.
 # Action:  Spins up a Devin session to triage and remediate the finding.
 #
 # SETUP (drop this file into any repo):
@@ -19,8 +19,8 @@
 name: "Devin: CodeQL Auto-Remediation"
 
 on:
-  code_scanning_alert:
-    types: [created, reopened]
+  repository_dispatch:
+    types: [code_scanning_alert]
   workflow_dispatch:
     inputs:
       alert_number:
@@ -30,7 +30,7 @@ on:
 
 # Only one remediation session per alert at a time
 concurrency:
-  group: devin-codeql-${{ github.event.alert.number || github.event.inputs.alert_number || github.run_id }}
+  group: devin-codeql-${{ github.event.client_payload.alert_number || github.event.inputs.alert_number || github.run_id }}
   cancel-in-progress: false
 
 permissions:
@@ -59,41 +59,34 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ github.event_name }}" = "code_scanning_alert" ]; then
-            ALERT_NUMBER="${{ github.event.alert.number }}"
-            RULE_ID="${{ github.event.alert.rule.id }}"
-            RULE_DESC="${{ github.event.alert.rule.description }}"
-            SEVERITY="${{ github.event.alert.rule.security_severity_level || github.event.alert.rule.severity }}"
-            TOOL_NAME="${{ github.event.alert.tool.name }}"
-            FILE_PATH="${{ github.event.alert.most_recent_instance.location.path }}"
-            START_LINE="${{ github.event.alert.most_recent_instance.location.start_line }}"
-            END_LINE="${{ github.event.alert.most_recent_instance.location.end_line }}"
-            HTML_URL="${{ github.event.alert.html_url }}"
-            CWES=$(echo '${{ toJSON(github.event.alert.rule.tags) }}' \
-              | jq -r '.[]? // empty' \
-              | grep -i '^cwe-' \
-              | tr '\n' ', ' \
-              | sed 's/,$//')
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            ALERT_NUMBER="${{ github.event.client_payload.alert_number }}"
           else
             ALERT_NUMBER="${{ github.event.inputs.alert_number }}"
-            REPO="${{ github.repository }}"
-            ALERT_JSON=$(curl -s \
-              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              -H "Accept: application/vnd.github+json" \
-              "https://api.github.com/repos/${REPO}/code-scanning/alerts/${ALERT_NUMBER}")
-            RULE_ID=$(echo "$ALERT_JSON" | jq -r '.rule.id // empty')
-            RULE_DESC=$(echo "$ALERT_JSON" | jq -r '.rule.description // empty')
-            SEVERITY=$(echo "$ALERT_JSON" | jq -r '.rule.security_severity_level // .rule.severity // empty')
-            TOOL_NAME=$(echo "$ALERT_JSON" | jq -r '.tool.name // empty')
-            FILE_PATH=$(echo "$ALERT_JSON" | jq -r '.most_recent_instance.location.path // empty')
-            START_LINE=$(echo "$ALERT_JSON" | jq -r '.most_recent_instance.location.start_line // empty')
-            END_LINE=$(echo "$ALERT_JSON" | jq -r '.most_recent_instance.location.end_line // empty')
-            HTML_URL=$(echo "$ALERT_JSON" | jq -r '.html_url // empty')
-            CWES=$(echo "$ALERT_JSON" | jq -r '.rule.tags[]? // empty' \
-              | grep -i '^cwe-' \
-              | tr '\n' ', ' \
-              | sed 's/,$//')
           fi
+
+          if [ -z "$ALERT_NUMBER" ]; then
+            echo "::error::No alert number provided"
+            exit 1
+          fi
+
+          REPO="${{ github.repository }}"
+          ALERT_JSON=$(curl -s \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${REPO}/code-scanning/alerts/${ALERT_NUMBER}")
+          RULE_ID=$(echo "$ALERT_JSON" | jq -r '.rule.id // empty')
+          RULE_DESC=$(echo "$ALERT_JSON" | jq -r '.rule.description // empty')
+          SEVERITY=$(echo "$ALERT_JSON" | jq -r '.rule.security_severity_level // .rule.severity // empty')
+          TOOL_NAME=$(echo "$ALERT_JSON" | jq -r '.tool.name // empty')
+          FILE_PATH=$(echo "$ALERT_JSON" | jq -r '.most_recent_instance.location.path // empty')
+          START_LINE=$(echo "$ALERT_JSON" | jq -r '.most_recent_instance.location.start_line // empty')
+          END_LINE=$(echo "$ALERT_JSON" | jq -r '.most_recent_instance.location.end_line // empty')
+          HTML_URL=$(echo "$ALERT_JSON" | jq -r '.html_url // empty')
+          CWES=$(echo "$ALERT_JSON" | jq -r '.rule.tags[]? // empty' \
+            | grep -i '^cwe-' \
+            | tr '\n' ', ' \
+            | sed 's/,$//')
 
           REPO_FULL="${{ github.repository }}"
 
